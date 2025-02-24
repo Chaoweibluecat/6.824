@@ -1,71 +1,161 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"syscall"
+	"time"
+)
 
+const MAP_TASK int = 1
+const REDUCE_TASK int = 2
+const PENDING int = 3
+const EXIT int = 4
 
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
+type MyWorker struct {
+	files []*os.File
+}
+
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func getReduceNum() (int, int) {
+	reply := ReduceTaskNumReply{}
+	request := EmptyStruct{}
+	call("Master.GetMRCount", &request, &reply)
+	return reply.MNum, reply.RNum
+}
 
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-
+	reduceNum, mapNum := getReduceNum()
+	for {
+		//output files for
+		task := fetchTask()
+		// map
+		if task.TaskType == MAP_TASK {
+			doMap(mapf, task, reduceNum)
+		} else if task.TaskType == REDUCE_TASK {
+			doReduce(task.Id, mapNum, reducef)
+		} else if task.TaskType == PENDING {
+			time.Sleep(1 * time.Second)
+		} else {
+			syscall.Shutdown(1, 2)
+		}
+	}
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+// reduce
+func doReduce(reduceId int, mapNum int, reducef func(string, []string) string) {
+	keyToPacketValues := make(map[string][]string)
+	ks := []string{}
+	//  轮询每一个worker的输出文件
+	for i := 0; i < mapNum; i++ {
+		path := "mr-" + fmt.Sprint(i) + "-" + fmt.Sprint(reduceId)
+		file, err := os.Open(path)
+		// no file found
+		if err != nil {
+			continue
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			keyToPacketValues[kv.Key] = append(keyToPacketValues[kv.Key], kv.Value)
+		}
+	}
+	// 排序并写结果
+	outputFile, _ := os.Create("mr-out-" + fmt.Sprint(reduceId))
+	for k := range keyToPacketValues {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	for _, k := range ks {
+		values := keyToPacketValues[k]
+		if len(values) == 0 {
+			continue
+		}
+		keyOutPutReduced := reducef(k, values)
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(outputFile, "%v %v\n", k, keyOutPutReduced)
+	}
+	reportTaskDone(reduceId, REDUCE_TASK)
+}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+func reportTaskDone(id int, tp int) {
+	args := ReportTaskDoneRequest{tp, id}
+	res := EmptyStruct{}
+	call("Master.TaskDone", &args, &res)
+}
 
-	// fill in the argument(s).
-	args.X = 99
-
+func fetchTask() *FetchTaskReply {
 	// declare a reply structure.
-	reply := ExampleReply{}
-
+	reply := FetchTaskReply{}
+	request := EmptyStruct{}
 	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
+	call("Master.FetchTask", &request, &reply)
+	fmt.Printf("客户端收到的 reply: %+v\n", reply) // 打印 reply
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	return &reply
 }
 
-//
+func doMap(mapf func(string, string) []KeyValue, task *FetchTaskReply, reduceNum int) {
+	name := task.FileName
+	file, _ := os.Open(name)
+	content, _ := ioutil.ReadAll(file)
+	file.Close()
+	output := mapf(name, string(content))
+	//mapResultInit
+	partition := [][]KeyValue{}
+	for i := 0; i < reduceNum; i++ {
+		temp := []KeyValue{}
+		partition = append(partition, temp)
+	}
+	// mapResult partition
+	for _, kv := range output {
+		idx := ihash(kv.Key) % reduceNum
+		partition[idx] = append(partition[idx], kv)
+	}
+	// write mapresult
+	for idx, outputPacket := range partition {
+		packetFileName := "mr-" + fmt.Sprint(task.Id) + "-" + fmt.Sprint(idx)
+		file, _ := os.Create(packetFileName)
+		defer file.Close()
+		enc := json.NewEncoder(file)
+		for _, kv := range outputPacket {
+			err := enc.Encode(&kv)
+			if err != nil {
+				panic("we fucked up")
+			}
+		}
+	}
+	reportTaskDone(task.Id, MAP_TASK)
+}
+
 // send an RPC request to the master, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := masterSock()
