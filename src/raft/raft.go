@@ -17,14 +17,17 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"crypto/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -52,21 +55,31 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	votedFor  int                 // who i voted for
+	term 	  int 				  // current term nv
+	log   	  []LogEntry  		  // test
+	lastLogIndex	int 
+	leader	  int
+	lastHeartBeat int64
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
 }
+
+type LogEntry struct {
+	term	int
+}
+
+const NO_VOTE_YET int = -1
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.term, rf.leader == rf.me
 }
 
 //
@@ -116,21 +129,52 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	CandidataId int
+	Term 		int
+	LastLogIndex	int // see raft 5.4
+	LastLogTerm		int 
 }
 
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
+
 type RequestVoteReply struct {
-	// Your data here (2A).
+	Term int
+	VoteGranted bool
 }
 
+
+type AppendEntriesRequest struct {
+	
+}
+
+type AppendEntriesResponse struct {
+	
+}
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// 过期的candidate,拒绝
+	if args.Term < rf.term {
+		reply.Term = rf.term
+		reply.VoteGranted = false
+		return
+	}
+	// 过期
+	if rf.votedFor == NO_VOTE_YET || rf.votedFor == args.CandidataId {
+		// 额外的candidate check, 确保candidate有所有的committedLog
+		// (voter否决lastLog没有自己新的candidate)
+		// 如果candidate没有所有commitedLog,它就不会有majority选票
+		last_log_term := rf.log[len(rf.log)-1].term 
+		if last_log_term < args.Term || (last_log_term == args.Term && args.LastLogIndex >= rf.lastLogIndex) {
+				reply.Term = args.Term
+				reply.VoteGranted = true
+				return 
+		}
+	} 
+	reply.Term = args.Term
+	reply.VoteGranted = false
 	// Your code here (2A, 2B).
 }
 
@@ -166,7 +210,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
+
+func (rf *Raft) sendHeartBeat() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for idx, peer := range(rf.peers) {
+		if idx != rf.me {
+			go func ()  {
+				heartBeat := AppendEntriesRequest{}
+				reponse := AppendEntriesResponse{}
+				rf.sendAppendRPC(peer, &heartBeat, &reponse)
+			}()
+		}
+	}
 }
+
+func (rf *Raft) sendAppendRPC(c *labrpc.ClientEnd, args *AppendEntriesRequest, reply *AppendEntriesResponse) {
+	c.Call("Raft.AppendEntries", args, reply)
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesResponse) {
+	
+}
+
 
 
 //
@@ -234,10 +300,79 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	rf.lastLogIndex = 0
+	rf.votedFor = NO_VOTE_YET
+	rf.term = 0
+	rf.lastHeartBeat = 0
+	go func ()  {
+		rf.checkHeartBeat(0)
+	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 
 	return rf
+
+	
+}
+
+func (rf *Raft) checkHeartBeat(lastHeartBeat int64) {
+		time.Sleep(200 * time.Millisecond)
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.lastHeartBeat == lastHeartBeat {
+			electAsCandidate(rf)
+		} else {
+			return
+		}
+}
+
+
+
+type VoteChannel struct {
+	yes int 
+	no  int
+}
+
+// require mutex?
+func (rf *Raft) electAsCandidate() bool{
+	yes := 1
+	no := 0
+	electionEndChan := make(chan struct{})
+	electionEnd := false
+	defer electionEndChan.close()
+	timeout := rand.Int(200, 400)
+    var mu sync.Mutex
+	
+	for idx, _ := range(rf.peers) {
+		if idx != rf.me {
+			go func ()  {
+				request = RequestVoteArgs{}
+				response = RequestVoteReply{}
+				res := rf.sendRequestVote(idx, request, reponse)
+				mu.Lock()
+				defer mu.Unlock()
+				if (electionEnd) {
+					return
+				}
+				if res && reponse.VoteGranted {
+					yes += 1
+				} else {
+					no += 1
+				}
+				if yes >= (len(rf.peers) + 1) / 2 || no >= len(rf.peers) + 1 / 2{
+					electionEnd = true
+					electionEndChan <- struct{}{}
+				}	
+			}()
+		}
+	}
+	
+    select {
+    	case _ := <-electionEndChan:
+        	return yes >= (len(rf.peers) + 1) / 2 
+    	case <-time.After(timeout):
+        	return electAsCandidate()
+    }
+
 }
