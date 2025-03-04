@@ -48,18 +48,21 @@ type ApplyMsg struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu                  sync.Mutex          // Lock to protect shared access to this peer's state
-	peers               []*labrpc.ClientEnd // RPC end points of all peers
-	persister           *Persister          // Object to hold this peer's persisted state
-	me                  int                 // this peer's index into peers[]
-	dead                int32               // set by Kill()
-	votedFor            int                 // who i voted for
-	term                int32               // current term nv
-	log                 []LogEntry          // test
-	lastLogIndex        int32
-	state               int
-	lastHeartBeat       int64
-	anotherWinnerChanel chan struct{}
+	mu            sync.Mutex          // Lock to protect shared access to this peer's state
+	peers         []*labrpc.ClientEnd // RPC end points of all peers
+	persister     *Persister          // Object to hold this peer's persisted state
+	me            int                 // this peer's index into peers[]
+	dead          int32               // set by Kill()
+	votedFor      int                 // who i voted for
+	term          int32               // current term nv
+	log           []LogEntry          // test
+	lastLogIndex  int32
+	state         int
+	lastHeartBeat int64
+	nextIndex     []int
+	// instance唯一,所以发消息前要double check是不是当前任期的消息
+	swicthToFollowerChan chan struct{}
+	commitIndex          int
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -67,7 +70,7 @@ type Raft struct {
 }
 
 type LogEntry struct {
-	term int32
+	Term int32
 }
 
 const NO_VOTE_YET int = -1
@@ -133,17 +136,22 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesRequest struct {
-	Term int32
+	Term         int32
+	leaderId     int
+	prevLogIndex int
+	prevLogTerm  int
+	entries      []LogEntry
+	leaderCommit int
 }
 
 type AppendEntriesResponse struct {
+	Term    int32
 	Success bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	log.Printf("%d :receive vote, request %v", rf.me, args)
-
 	rf.mu.Lock()
 	myTerm := rf.term
 	myvote := rf.votedFor
@@ -155,6 +163,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.mu.Unlock()
 		return
 	}
+	switchToFollower := args.Term > myTerm && rf.state != FOLLOWER
+	if args.Term > myTerm {
+		rf.votedFor = NO_VOTE_YET
+		rf.state = FOLLOWER
+	}
 	// 过期
 	if myvote == NO_VOTE_YET || myvote == args.CandidataId {
 		// 额外的candidate check, 确保candidate有所有的committedLog
@@ -164,7 +177,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if len(rf.log) == 0 {
 			last_log_term = -1
 		} else {
-			last_log_term = rf.log[len(rf.log)-1].term
+			last_log_term = rf.log[len(rf.log)-1].Term
 		}
 
 		if last_log_term < args.Term || (last_log_term == args.Term && args.LastLogIndex >= rf.lastLogIndex) {
@@ -173,14 +186,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidataId
 			log.Printf("%d :vote yes, request %v, reponse %v", rf.me, args, reply)
 			rf.mu.Unlock()
+			if switchToFollower {
+				rf.swicthToFollowerChan <- struct{}{}
+			}
 			return
 		}
 	}
-
-	rf.mu.Unlock()
 	log.Printf("%d :voting rejected because I alreadt vote %d, my term %d", rf.me, rf.votedFor, rf.term)
 	reply.Term = args.Term
 	reply.VoteGranted = false
+	rf.mu.Unlock()
+	if switchToFollower {
+		rf.swicthToFollowerChan <- struct{}{}
+	}
 	// Your code here (2A, 2B).
 }
 
@@ -224,14 +242,26 @@ func (rf *Raft) sendHeartBeat() {
 				heartBeat := AppendEntriesRequest{}
 				heartBeat.Term = currentTerm
 				reponse := AppendEntriesResponse{}
-				rf.sendAppendRPC(idx, &heartBeat, &reponse)
+				ok := rf.sendAppendRPC(idx, &heartBeat, &reponse)
+				if ok && !reponse.Success {
+					rf.mu.Lock()
+					if reponse.Term > rf.term {
+						if rf.term == currentTerm && rf.state == LEADER {
+							rf.term = reponse.Term
+							rf.mu.Unlock()
+							rf.swicthToFollowerChan <- struct{}{}
+						}
+					}
+					rf.mu.Unlock()
+				}
 			}(idx)
 		}
 	}
 }
 
-func (rf *Raft) sendAppendRPC(server int, args *AppendEntriesRequest, reply *AppendEntriesResponse) {
-	rf.peers[server].Call("Raft.AppendEntries", args, reply)
+func (rf *Raft) sendAppendRPC(server int, args *AppendEntriesRequest, reply *AppendEntriesResponse) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesResponse) {
@@ -251,7 +281,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		log.Printf("%d: another leader, shift into follower", rf.me)
 		rf.state = FOLLOWER
 		rf.mu.Unlock()
-		rf.anotherWinnerChanel <- struct{}{}
+		rf.swicthToFollowerChan <- struct{}{}
 	} else {
 		rf.mu.Unlock()
 	}
@@ -273,10 +303,30 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
+	rf.mu.Lock()
+	if rf.state != LEADER {
+		isLeader = false
+		rf.mu.Unlock()
+		return index, term, isLeader
+	}
+	newLog := LogEntry{rf.term}
+	prevLogIndex := 0
+	prevLogTerm := 0
+	if len(rf.log) != 0 {
+		prevLogIndex = len(rf.log)
+		prevLogTerm = (int)(rf.log[len(rf.log)-1].Term)
+	}
+	rf.log = append(rf.log, newLog)
+	currentTerm := rf.term
 
+	append := AppendEntriesRequest{currentTerm, rf.me, prevLogIndex, prevLogTerm, []LogEntry{newLog}, rf.commitIndex}
+	for idx := range rf.peers {
+		if idx != rf.me {
+
+		}
+	}
 	// Your code here (2B).
 
-	return index, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -317,7 +367,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastLogIndex = 0
 	rf.term = 0
 	rf.lastHeartBeat = 0
-	rf.anotherWinnerChanel = make(chan struct{})
+	rf.commitIndex = 0
+	rf.swicthToFollowerChan = make(chan struct{})
 	go func() {
 		rf.mu.Lock()
 		for {
@@ -334,8 +385,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.mu.Lock()
 					// timeout, no state change
 					continue
-				case <-rf.anotherWinnerChanel:
-
+				case <-rf.swicthToFollowerChan:
 					rf.mu.Lock()
 					log.Printf("%d: channel message acceptted", rf.me)
 					continue
@@ -362,10 +412,10 @@ func (rf *Raft) checkHeartBeat() {
 }
 
 func randTimeout() int {
-	max := big.NewInt(350)
+	max := big.NewInt(200)
 	bigx, _ := rand.Int(rand.Reader, max)
 	x := bigx.Int64()
-	return (int)(x + 150)
+	return (int)(x + 200)
 }
 
 // require mutex?
@@ -377,6 +427,7 @@ func (rf *Raft) electAsCandidate() {
 	electionEndChan := make(chan struct{})
 	electionEnd := false
 	timeout := randTimeout()
+	cur_term := rf.term
 	var mu sync.Mutex
 	for idx := range rf.peers {
 		if idx != rf.me {
@@ -384,7 +435,7 @@ func (rf *Raft) electAsCandidate() {
 				request := RequestVoteArgs{}
 				response := RequestVoteReply{}
 				request.CandidataId = rf.me
-				request.Term = rf.term
+				request.Term = cur_term
 				if len(rf.log) == 0 {
 					request.LastLogIndex = 0
 					request.LastLogTerm = 0
@@ -422,7 +473,7 @@ func (rf *Raft) electAsCandidate() {
 		rf.mu.Lock()
 		// timeout, no state change
 		return
-	case <-rf.anotherWinnerChanel:
+	case <-rf.swicthToFollowerChan:
 		rf.mu.Lock()
 		return
 	}
