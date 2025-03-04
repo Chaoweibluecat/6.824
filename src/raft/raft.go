@@ -317,8 +317,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		prevLogTerm = (int)(rf.log[len(rf.log)-1].Term)
 	}
 	rf.log = append(rf.log, newLog)
+	index = len(rf.log)
 	currentTerm := rf.term
-
+	term = int(rf.term)
+	rf.mu.Unlock()
+	return index, term, true
 	append := AppendEntriesRequest{currentTerm, rf.me, prevLogIndex, prevLogTerm, []LogEntry{newLog}, rf.commitIndex}
 	for idx := range rf.peers {
 		if idx != rf.me {
@@ -379,6 +382,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.electAsCandidate()
 			} else if rf.state == LEADER {
 				rf.sendHeartBeat()
+				rf.sendAppendEntries()
 				rf.mu.Unlock()
 				select {
 				case <-time.After(time.Duration(200) * (time.Millisecond)):
@@ -398,6 +402,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 
+}
+func (rf *Raft) sendAppendEntries() {
+	go func ()  {
+		
+	}
 }
 
 func (rf *Raft) checkHeartBeat() {
