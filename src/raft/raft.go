@@ -60,6 +60,7 @@ type Raft struct {
 	state         int
 	lastHeartBeat int64
 	nextIndex     []int
+	matchIndex	  []int
 	// instance唯一,所以发消息前要double check是不是当前任期的消息
 	swicthToFollowerChan chan struct{}
 	commitIndex          int
@@ -310,22 +311,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 	newLog := LogEntry{rf.term}
-	prevLogIndex := 0
-	prevLogTerm := 0
-	if len(rf.log) != 0 {
-		prevLogIndex = len(rf.log)
-		prevLogTerm = (int)(rf.log[len(rf.log)-1].Term)
-	}
+	
 	rf.log = append(rf.log, newLog)
-	index = len(rf.log)
 	currentTerm := rf.term
-	term = int(rf.term)
-	rf.mu.Unlock()
-	return index, term, true
-	append := AppendEntriesRequest{currentTerm, rf.me, prevLogIndex, prevLogTerm, []LogEntry{newLog}, rf.commitIndex}
+
 	for idx := range rf.peers {
 		if idx != rf.me {
-
+			go func ()  {
+				rf.sendAppendRPC(idx, args, )
+			}
 		}
 	}
 	// Your code here (2B).
@@ -349,6 +343,36 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) sendAppendEntries() bool {
+	rf.mu.Lock()
+	lastlogIdx := len(rf.log)
+	for idx := range rf.peers {
+		if idx == rf.me {
+			continue
+		}
+		if  lastlogIdx >= rf.nextIndex[idx] {
+			go func(idx int) {
+				prevLogIndex := 0
+				prevLogTerm := 0
+				if len(rf.log) != 0 {
+					prevLogIndex = len(rf.log)
+					prevLogTerm = (int)(rf.log[len(rf.log)-1].Term)
+				}
+				args := AppendEntriesRequest{
+					rf.term,
+					 rf.me,
+					  prevLogIndex, 
+					  prevLogTerm,
+					 rf.log[rf.nextIndex[idx] -1:len(rf.log)-1], 
+					 rf.commitIndex}
+				response :=AppendEntriesResponse{}
+				ok := rf.sendAppendRPC(idx, &args, &response)
+				
+			}(idx)
+		}
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -382,7 +406,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.electAsCandidate()
 			} else if rf.state == LEADER {
 				rf.sendHeartBeat()
-				rf.sendAppendEntries()
 				rf.mu.Unlock()
 				select {
 				case <-time.After(time.Duration(200) * (time.Millisecond)):
@@ -402,11 +425,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 
-}
-func (rf *Raft) sendAppendEntries() {
-	go func ()  {
-		
-	}
 }
 
 func (rf *Raft) checkHeartBeat() {
