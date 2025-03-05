@@ -154,23 +154,21 @@ type AppendEntriesResponse struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	log.Printf("%d :receive vote, request %v", rf.me, args)
 	rf.mu.Lock()
-	myTerm := rf.term
-	myvote := rf.votedFor
 	// 过期的candidate,拒绝
-	if args.Term < myTerm {
-		reply.Term = myTerm
+	if args.Term < rf.term {
+		reply.Term = rf.term
 		reply.VoteGranted = false
 		log.Printf("%d :voting rejected because legacy term, request %v, reponse %v", rf.me, args, reply)
 		rf.mu.Unlock()
 		return
 	}
-	switchToFollower := args.Term > myTerm && rf.state != FOLLOWER
-	if args.Term > myTerm {
+	switchToFollower := args.Term > rf.term && rf.state != FOLLOWER
+	if args.Term > rf.term {
 		rf.votedFor = NO_VOTE_YET
 		rf.state = FOLLOWER
 	}
 	// 过期
-	if myvote == NO_VOTE_YET || myvote == args.CandidataId {
+	if rf.votedFor == NO_VOTE_YET || rf.votedFor == args.CandidataId {
 		// 额外的candidate check, 确保candidate有所有的committedLog
 		// (voter否决lastLog没有自己新的candidate)
 		// 如果candidate没有所有commitedLog,它就不会有majority选票
@@ -193,6 +191,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 	}
+
 	log.Printf("%d :voting rejected because I alreadt vote %d, my term %d", rf.me, rf.votedFor, rf.term)
 	reply.Term = args.Term
 	reply.VoteGranted = false
@@ -245,16 +244,14 @@ func (rf *Raft) sendHeartBeat() {
 				reponse := AppendEntriesResponse{}
 				ok := rf.sendAppendRPC(idx, &heartBeat, &reponse)
 				if ok && !reponse.Success {
+					rf.mu.Lock()
 					if reponse.Term > rf.term {
-						// ???
-						rf.mu.Lock()
 						if rf.term == currentTerm && rf.state == LEADER {
 							rf.term = reponse.Term
-							rf.mu.Unlock()
 							rf.swicthToFollowerChan <- struct{}{}
 						}
-						rf.mu.Unlock()
 					}
+					rf.mu.Unlock()
 				}
 			}(idx)
 		}
@@ -453,7 +450,7 @@ func randTimeout() int {
 // require mutex?
 func (rf *Raft) electAsCandidate() {
 	rf.votedFor = rf.me
-	atomic.AddInt32(&rf.term, 1)
+	rf.term += 1
 	yes := 1
 	no := 0
 	electionEndChan := make(chan struct{})
