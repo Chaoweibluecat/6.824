@@ -54,9 +54,9 @@ type Raft struct {
 	me            int                 // this peer's index into peers[]
 	dead          int32               // set by Kill()
 	votedFor      int                 // who i voted for
-	term          int32               // current term nv
+	term          int                 // current term nv
 	log           []LogEntry          // test
-	lastLogIndex  int32
+	lastLogIndex  int
 	state         int
 	lastHeartBeat int64
 	nextIndex     []int
@@ -71,7 +71,7 @@ type Raft struct {
 }
 
 type LogEntry struct {
-	Term int32
+	Term int
 }
 
 const NO_VOTE_YET int = -1
@@ -126,18 +126,18 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	CandidataId  int
-	Term         int32
-	LastLogIndex int32 // see raft 5.4
-	LastLogTerm  int32
+	Term         int
+	LastLogIndex int // see raft 5.4
+	LastLogTerm  int
 }
 
 type RequestVoteReply struct {
-	Term        int32
+	Term        int
 	VoteGranted bool
 }
 
 type AppendEntriesRequest struct {
-	Term int32
+	Term int
 	// leaderId     int
 	// prevLogIndex int
 	// prevLogTerm  int
@@ -146,7 +146,7 @@ type AppendEntriesRequest struct {
 }
 
 type AppendEntriesResponse struct {
-	Term    int32
+	Term    int
 	Success bool
 }
 
@@ -174,7 +174,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 额外的candidate check, 确保candidate有所有的committedLog
 		// (voter否决lastLog没有自己新的candidate)
 		// 如果candidate没有所有commitedLog,它就不会有majority选票
-		var last_log_term int32
+		var last_log_term int
 		if len(rf.log) == 0 {
 			last_log_term = -1
 		} else {
@@ -246,6 +246,7 @@ func (rf *Raft) sendHeartBeat() {
 				ok := rf.sendAppendRPC(idx, &heartBeat, &reponse)
 				if ok && !reponse.Success {
 					if reponse.Term > rf.term {
+						// ???
 						rf.mu.Lock()
 						if rf.term == currentTerm && rf.state == LEADER {
 							rf.term = reponse.Term
@@ -270,14 +271,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	rf.mu.Lock()
 	if args.Term < rf.term {
 		reply.Success = false
+		reply.Term = rf.term
 		rf.mu.Unlock()
 		return
 	}
+	if args.Term > rf.term {
+		rf.votedFor = NO_VOTE_YET
+		rf.term = args.Term
+	}
 	//catch up
-	rf.term = args.Term
-	current := time.Now().UnixMilli()
-	atomic.StoreInt64(&rf.lastHeartBeat, current)
-	rf.votedFor = NO_VOTE_YET
+	rf.lastHeartBeat = time.Now().UnixMilli()
 	if rf.state != FOLLOWER {
 		log.Printf("%d: another leader, shift into follower", rf.me)
 		rf.state = FOLLOWER
