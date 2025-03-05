@@ -166,6 +166,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.term {
 		rf.votedFor = NO_VOTE_YET
 		rf.state = FOLLOWER
+		rf.term = args.Term
 	}
 	// 过期
 	if rf.votedFor == NO_VOTE_YET || rf.votedFor == args.CandidataId {
