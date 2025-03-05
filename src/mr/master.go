@@ -93,7 +93,6 @@ func (m *Master) FetchTask(args EmptyStruct, reply *FetchTaskReply) error {
 }
 
 func (m *Master) TaskDone(args *ReportTaskDoneRequest, reply *EmptyStruct) error {
-
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	if args.Tp == MAP_TASK {

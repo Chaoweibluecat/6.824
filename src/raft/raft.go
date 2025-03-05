@@ -60,7 +60,7 @@ type Raft struct {
 	state         int
 	lastHeartBeat int64
 	nextIndex     []int
-	matchIndex	  []int
+	matchIndex    []int
 	// instance唯一,所以发消息前要double check是不是当前任期的消息
 	swicthToFollowerChan chan struct{}
 	commitIndex          int
@@ -137,12 +137,12 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesRequest struct {
-	Term         int32
-	leaderId     int
-	prevLogIndex int
-	prevLogTerm  int
-	entries      []LogEntry
-	leaderCommit int
+	Term int32
+	// leaderId     int
+	// prevLogIndex int
+	// prevLogTerm  int
+	// entries      []LogEntry
+	// leaderCommit int
 }
 
 type AppendEntriesResponse struct {
@@ -245,15 +245,15 @@ func (rf *Raft) sendHeartBeat() {
 				reponse := AppendEntriesResponse{}
 				ok := rf.sendAppendRPC(idx, &heartBeat, &reponse)
 				if ok && !reponse.Success {
-					rf.mu.Lock()
 					if reponse.Term > rf.term {
+						rf.mu.Lock()
 						if rf.term == currentTerm && rf.state == LEADER {
 							rf.term = reponse.Term
 							rf.mu.Unlock()
 							rf.swicthToFollowerChan <- struct{}{}
 						}
+						rf.mu.Unlock()
 					}
-					rf.mu.Unlock()
 				}
 			}(idx)
 		}
@@ -304,24 +304,26 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-	rf.mu.Lock()
-	if rf.state != LEADER {
-		isLeader = false
-		rf.mu.Unlock()
-		return index, term, isLeader
-	}
-	newLog := LogEntry{rf.term}
-	
-	rf.log = append(rf.log, newLog)
-	currentTerm := rf.term
+	// rf.mu.Lock()
+	// if rf.state != LEADER {
+	// 	isLeader = false
+	// 	rf.mu.Unlock()
+	// 	return index, term, isLeader
+	// }
+	// newLog := LogEntry{rf.term}
 
-	for idx := range rf.peers {
-		if idx != rf.me {
-			go func ()  {
-				rf.sendAppendRPC(idx, args, )
-			}
-		}
-	}
+	// rf.log = append(rf.log, newLog)
+	// currentTerm := rf.term
+
+	// for idx := range rf.peers {
+	// 	if idx != rf.me {
+	// 		go func ()  {
+	// 			rf.sendAppendRPC(idx, args, )
+	// 		}
+	// 	}
+	// }
+	return index, term, isLeader
+
 	// Your code here (2B).
 
 }
@@ -346,33 +348,34 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) sendAppendEntries() bool {
-	rf.mu.Lock()
-	lastlogIdx := len(rf.log)
-	for idx := range rf.peers {
-		if idx == rf.me {
-			continue
-		}
-		if  lastlogIdx >= rf.nextIndex[idx] {
-			go func(idx int) {
-				prevLogIndex := 0
-				prevLogTerm := 0
-				if len(rf.log) != 0 {
-					prevLogIndex = len(rf.log)
-					prevLogTerm = (int)(rf.log[len(rf.log)-1].Term)
-				}
-				args := AppendEntriesRequest{
-					rf.term,
-					 rf.me,
-					  prevLogIndex, 
-					  prevLogTerm,
-					 rf.log[rf.nextIndex[idx] -1:len(rf.log)-1], 
-					 rf.commitIndex}
-				response :=AppendEntriesResponse{}
-				ok := rf.sendAppendRPC(idx, &args, &response)
-				
-			}(idx)
-		}
-	}
+	return true
+	// rf.mu.Lock()
+	// lastlogIdx := len(rf.log)
+	// for idx := range rf.peers {
+	// 	if idx == rf.me {
+	// 		continue
+	// 	}
+	// 	if lastlogIdx >= rf.nextIndex[idx] {
+	// 		go func(idx int) {
+	// 			prevLogIndex := 0
+	// 			prevLogTerm := 0
+	// 			if len(rf.log) != 0 {
+	// 				prevLogIndex = len(rf.log)
+	// 				prevLogTerm = (int)(rf.log[len(rf.log)-1].Term)
+	// 			}
+	// 			args := AppendEntriesRequest{
+	// 				rf.term,
+	// 				rf.me,
+	// 				prevLogIndex,
+	// 				prevLogTerm,
+	// 				rf.log[rf.nextIndex[idx]-1 : len(rf.log)-1],
+	// 				rf.commitIndex}
+	// 			response := AppendEntriesResponse{}
+	// 			ok := rf.sendAppendRPC(idx, &args, &response)
+
+	// 		}(idx)
+	// 	}
+	// }
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -399,7 +402,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go func() {
 		rf.mu.Lock()
 		for {
-			rf.votedFor = NO_VOTE_YET
 			if rf.state == FOLLOWER {
 				rf.checkHeartBeat()
 			} else if rf.state == CANDIDATE {
@@ -480,6 +482,13 @@ func (rf *Raft) electAsCandidate() {
 				}
 				if yes >= (len(rf.peers)+1)/2 || no >= (len(rf.peers)+1)/2 {
 					electionEnd = true
+					rf.mu.Lock()
+					// 同步更新状态, 并让发送消息让主循环继续
+					if rf.term == cur_term && yes >= (len(rf.peers)+1)/2 {
+						log.Printf("%d I win election for term %d", rf.me, rf.term)
+						rf.state = LEADER
+					}
+					rf.mu.Unlock()
 					electionEndChan <- struct{}{}
 				}
 			}(idx)
@@ -488,12 +497,8 @@ func (rf *Raft) electAsCandidate() {
 	rf.mu.Unlock()
 	select {
 	case <-electionEndChan:
-		close(electionEndChan)
 		rf.mu.Lock()
-		if yes >= (len(rf.peers)+1)/2 {
-			log.Printf("%d I win election for term %d", rf.me, rf.term)
-			rf.state = LEADER
-		}
+		close(electionEndChan)
 		return
 	case <-time.After(time.Duration(timeout) * (time.Millisecond)):
 		log.Printf("%d %dms elaspsed, TimeoutOut And No winner", rf.me, timeout)
