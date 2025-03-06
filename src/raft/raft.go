@@ -48,21 +48,26 @@ type ApplyMsg struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu            sync.Mutex          // Lock to protect shared access to this peer's state
-	peers         []*labrpc.ClientEnd // RPC end points of all peers
-	persister     *Persister          // Object to hold this peer's persisted state
-	me            int                 // this peer's index into peers[]
-	dead          int32               // set by Kill()
-	votedFor      int                 // who i voted for
-	term          int                 // current term nv
-	log           []LogEntry          // test
-	lastLogIndex  int
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	peers     []*labrpc.ClientEnd // RPC end points of all peers
+	persister *Persister          // Object to hold this peer's persisted state
+	me        int                 // this peer's index into peers[]
+	dead      int32               // set by Kill()
+	votedFor  int                 // who i voted for
+	term      int                 // current term nv
+	log       []LogEntry          // test
+
 	state         int
 	lastHeartBeat int64
-	nextIndex     []int
-	matchIndex    []int
+
+	nextIndex   []int
+	matchIndex  []int
+	lastApplied int
+
 	// instance唯一,所以发消息前要double check是不是当前任期的消息
 	swicthToFollowerChan chan struct{}
+	followerAppendCond   []sync.Cond
+	commitUpdateCond     *sync.Cond
 	commitIndex          int
 
 	// Your data here (2A, 2B, 2C).
@@ -71,7 +76,9 @@ type Raft struct {
 }
 
 type LogEntry struct {
-	Term int
+	Term    int
+	Index   int
+	Command interface{}
 }
 
 const NO_VOTE_YET int = -1
@@ -83,6 +90,7 @@ const CANDIDATE int = 1
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	// 此处需要mutex的原因是1.读两个变量不是原子的 2.有些函数异步执行，直到改完state释放锁前，状态都不应该暴露
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return (int)(rf.term), rf.state == LEADER
@@ -137,17 +145,33 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesRequest struct {
-	Term int
-	// leaderId     int
-	// prevLogIndex int
-	// prevLogTerm  int
-	// entries      []LogEntry
-	// leaderCommit int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesResponse struct {
 	Term    int
 	Success bool
+}
+
+func (rf *Raft) lastLogTerm() int {
+	if len(rf.log) == 0 {
+		return 0
+	} else {
+		return rf.log[len(rf.log)-1].Term
+	}
+}
+
+func (rf *Raft) lastLogIndex() int {
+	if len(rf.log) == 0 {
+		return 0
+	} else {
+		return rf.log[len(rf.log)-1].Index
+	}
 }
 
 // example RequestVote RPC handler.
@@ -173,14 +197,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 额外的candidate check, 确保candidate有所有的committedLog
 		// (voter否决lastLog没有自己新的candidate)
 		// 如果candidate没有所有commitedLog,它就不会有majority选票
-		var last_log_term int
-		if len(rf.log) == 0 {
-			last_log_term = -1
-		} else {
-			last_log_term = rf.log[len(rf.log)-1].Term
-		}
+		lastLogTerm := rf.lastLogTerm()
+		lastLogIndex := rf.lastLogIndex()
 
-		if last_log_term < args.Term || (last_log_term == args.Term && args.LastLogIndex >= rf.lastLogIndex) {
+		if lastLogTerm < args.Term || (lastLogTerm == args.Term && args.LastLogIndex >= lastLogIndex) {
 			reply.Term = args.Term
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidataId
@@ -236,25 +256,25 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendHeartBeat() {
-	currentTerm := rf.term
 	for idx := range rf.peers {
 		if idx != rf.me {
-			go func(idx int) {
-				heartBeat := AppendEntriesRequest{}
-				heartBeat.Term = currentTerm
-				reponse := AppendEntriesResponse{}
-				ok := rf.sendAppendRPC(idx, &heartBeat, &reponse)
-				if ok && !reponse.Success {
-					rf.mu.Lock()
-					if reponse.Term > rf.term {
-						if rf.term == currentTerm && rf.state == LEADER {
-							rf.term = reponse.Term
-							rf.swicthToFollowerChan <- struct{}{}
-						}
-					}
-					rf.mu.Unlock()
-				}
-			}(idx)
+			go rf.sendAppendEntriesOnce(idx, true)
+			// go func(idx int) {
+			// 	heartBeat := AppendEntriesRequest{}
+			// 	heartBeat.Term = currentTerm
+			// 	reponse := AppendEntriesResponse{}
+			// 	ok := rf.sendAppendRPC(idx, &heartBeat, &reponse)
+			// 	if ok && !reponse.Success {
+			// 		rf.mu.Lock()
+			// 		if reponse.Term > rf.term {
+			// 			if rf.term == currentTerm && rf.state == LEADER {
+			// 				rf.term = reponse.Term
+			// 				rf.swicthToFollowerChan <- struct{}{}
+			// 			}
+			// 		}
+			// 		rf.mu.Unlock()
+			// 	}
+			// }(idx)
 		}
 	}
 }
@@ -305,24 +325,26 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-	// rf.mu.Lock()
-	// if rf.state != LEADER {
-	// 	isLeader = false
-	// 	rf.mu.Unlock()
-	// 	return index, term, isLeader
-	// }
-	// newLog := LogEntry{rf.term}
+	if rf.killed() {
+		return index, term, isLeader
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != LEADER {
+		isLeader = false
+		return index, term, isLeader
+	}
+	// start from 1
+	newLog := LogEntry{rf.term, len(rf.log) + 1, command}
+	rf.log = append(rf.log, newLog)
 
-	// rf.log = append(rf.log, newLog)
-	// currentTerm := rf.term
-
-	// for idx := range rf.peers {
-	// 	if idx != rf.me {
-	// 		go func ()  {
-	// 			rf.sendAppendRPC(idx, args, )
-	// 		}
-	// 	}
-	// }
+	go func() {
+		for idx := range rf.followerAppendCond {
+			if idx != rf.me {
+				rf.followerAppendCond[idx].Signal()
+			}
+		}
+	}()
 	return index, term, isLeader
 
 	// Your code here (2B).
@@ -348,8 +370,57 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) sendAppendEntries() bool {
-	return true
+func (rf *Raft) sendAppendEntriesOnce(idx int, isHeartBeat bool) {
+	rf.mu.Lock()
+	request := AppendEntriesRequest{}
+	request.Term = rf.term
+	request.LeaderId = rf.me
+	real_next_idx := rf.nextIndex[idx] - 1
+	real_prev_log_idx := real_next_idx - 1
+	if real_prev_log_idx < len(rf.log) {
+		request.PrevLogIndex = 0
+		request.PrevLogTerm = 0
+	} else {
+		request.PrevLogIndex = rf.log[real_prev_log_idx].Index
+		request.PrevLogTerm = rf.log[real_prev_log_idx].Term
+	}
+	if isHeartBeat {
+		request.Entries = []LogEntry{}
+	} else {
+		request.Entries = rf.log[real_next_idx:len(rf.log)]
+	}
+	request.LeaderCommit = rf.commitIndex
+	reponse := AppendEntriesResponse{}
+	rf.mu.Unlock()
+	ok := rf.sendAppendRPC(idx, &request, &reponse)
+	if ok && !reponse.Success {
+		rf.mu.Lock()
+		// 确保rpc返回时，仍然在有效任期
+		if rf.term == request.Term && rf.state == LEADER {
+			// 因为任期过期失败
+			if reponse.Term > rf.term {
+				rf.term = reponse.Term
+				rf.swicthToFollowerChan <- struct{}{}
+			} else {
+				// 因为log一致性失败,decrement next
+				rf.nextIndex[idx] -= 1
+				//retry
+			}
+		}
+		rf.mu.Unlock()
+	} else if ok && !isHeartBeat {
+		rf.mu.Lock()
+		if rf.term == request.Term && rf.state == LEADER {
+			//update matchIdx,用成功request的最后一条日志的index,heartbeat不更新
+			rf.matchIndex[idx] = request.Entries[len(request.Entries)-1].Index
+			rf.nextIndex[idx] = rf.matchIndex[idx] + 1
+			rf.updateCommitIdx()
+		}
+		rf.mu.Unlock()
+	} else {
+		// retry
+	}
+
 	// rf.mu.Lock()
 	// lastlogIdx := len(rf.log)
 	// for idx := range rf.peers {
@@ -379,6 +450,36 @@ func (rf *Raft) sendAppendEntries() bool {
 	// }
 }
 
+// require rf.mu
+func (rf *Raft) updateCommitIdx() {
+	majority := rf.majority()
+	prevCommit := rf.commitIndex
+	// term单调递增，找到一个小于当前term的日志可以直接跳出循环了（不能提交非当前term)
+	for i := len(rf.log) - 1; i >= rf.commitIndex && rf.log[i].Term == rf.term; i-- {
+		count := 1
+		for j, match := range rf.matchIndex {
+			if j == rf.me {
+				continue
+			} else {
+				if match >= rf.log[i].Index {
+					count += 1
+				}
+				if count >= majority {
+					rf.commitIndex = rf.log[i].Index
+					break
+				}
+			}
+		}
+	}
+	if prevCommit != rf.commitIndex {
+		rf.commitUpdateCond.Signal()
+	}
+}
+
+func (rf *Raft) majority() int {
+	return (len(rf.peers) + 1) / 2
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -395,14 +496,45 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	// Your initialization code here (2A, 2B, 2C).
-	rf.lastLogIndex = 0
 	rf.term = 0
 	rf.lastHeartBeat = 0
 	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.swicthToFollowerChan = make(chan struct{})
+	rf.followerAppendCond = make([]sync.Cond, len(rf.peers))
+	for idx := range rf.peers {
+		if idx != me {
+			rf.followerAppendCond[idx] = *sync.NewCond(&sync.Mutex{})
+		}
+	}
+	rf.commitUpdateCond = sync.NewCond(&rf.mu)
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	//异步apply
+	go func() {
+		for !rf.killed() {
+			rf.mu.Lock()
+			for rf.lastApplied == rf.commitIndex {
+				rf.commitUpdateCond.Wait()
+			}
+			logs := make([]LogEntry, rf.commitIndex-rf.lastApplied)
+			copy(logs, rf.log[rf.lastApplied:rf.commitIndex])
+			rf.mu.Unlock()
+			for _, log := range logs {
+				msg := ApplyMsg{}
+				msg.Command = log.Command
+				msg.CommandIndex = log.Index
+				msg.CommandValid = true
+				applyCh <- msg
+			}
+		}
+	}()
+
 	go func() {
 		rf.mu.Lock()
-		for {
+		for !rf.killed() {
 			if rf.state == FOLLOWER {
 				rf.checkHeartBeat()
 			} else if rf.state == CANDIDATE {
@@ -411,7 +543,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.sendHeartBeat()
 				rf.mu.Unlock()
 				select {
-				case <-time.After(time.Duration(200) * (time.Millisecond)):
+				case <-time.After(time.Duration(150) * (time.Millisecond)):
 					rf.mu.Lock()
 					// timeout, no state change
 					continue
@@ -423,15 +555,38 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			}
 		}
 	}()
+
+	for idx := range rf.followerAppendCond {
+		if idx != rf.me {
+			go rf.sendFollowerRountine(idx)
+		}
+	}
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 	return rf
 
 }
 
+func (rf *Raft) sendFollowerRountine(idx int) {
+	rf.followerAppendCond[idx].L.Lock()
+	defer rf.followerAppendCond[idx].L.Unlock()
+	for !rf.killed() {
+		for !rf.needSendLog(idx) {
+			rf.followerAppendCond[idx].Wait()
+		}
+		rf.sendAppendEntriesOnce(idx, false)
+	}
+}
+
+func (rf *Raft) needSendLog(idx int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state == LEADER && rf.log[len(rf.log)-1].Index >= rf.nextIndex[idx]
+}
+
 func (rf *Raft) checkHeartBeat() {
-	lastHeartBeat := atomic.LoadInt64(&rf.lastHeartBeat)
+	lastHeartBeat := rf.lastHeartBeat
 	rf.mu.Unlock()
 	time.Sleep(time.Duration(randTimeout()) * time.Millisecond)
 	rf.mu.Lock()
@@ -442,10 +597,10 @@ func (rf *Raft) checkHeartBeat() {
 }
 
 func randTimeout() int {
-	max := big.NewInt(200)
+	max := big.NewInt(150)
 	bigx, _ := rand.Int(rand.Reader, max)
 	x := bigx.Int64()
-	return (int)(x + 200)
+	return (int)(x + 150)
 }
 
 // require mutex?
@@ -466,10 +621,8 @@ func (rf *Raft) electAsCandidate() {
 				response := RequestVoteReply{}
 				request.CandidataId = rf.me
 				request.Term = cur_term
-				if len(rf.log) == 0 {
-					request.LastLogIndex = 0
-					request.LastLogTerm = 0
-				}
+				request.LastLogIndex = rf.lastLogIndex()
+				request.LastLogTerm = rf.lastLogTerm()
 				res := rf.sendRequestVote(idx, &request, &response)
 				mu.Lock()
 				defer mu.Unlock()
@@ -488,6 +641,16 @@ func (rf *Raft) electAsCandidate() {
 					if rf.term == cur_term && yes >= (len(rf.peers)+1)/2 {
 						log.Printf("%d I win election for term %d", rf.me, rf.term)
 						rf.state = LEADER
+						// leader的必要初始化
+						// nextIndex, matchidx是volatile的,每次当选后从0开始,在appendRPC中更新
+						// 需要在这个线程持有锁时同步进行，确保原子性
+						rf.matchIndex = make([]int, len(rf.peers))
+						rf.nextIndex = make([]int, len(rf.peers))
+						for idx := range rf.peers {
+							rf.matchIndex[idx] = 0
+							// leader last Idx = len(rf.log), next = .. + 1
+							rf.nextIndex[idx] = len(rf.log) + 1
+						}
 					}
 					rf.mu.Unlock()
 					electionEndChan <- struct{}{}
