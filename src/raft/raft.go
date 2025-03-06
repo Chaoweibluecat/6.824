@@ -87,6 +87,12 @@ const LEADER int = 2
 const FOLLOWER int = 0
 const CANDIDATE int = 1
 
+func assert(condition bool, message string) {
+	if !condition {
+		panic("Assertion failed: " + message)
+	}
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -297,8 +303,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.votedFor = NO_VOTE_YET
 		rf.term = args.Term
 	}
-	//catch up
 	rf.lastHeartBeat = time.Now().UnixMilli()
+	if rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		log.Printf("%d: rejected AppendRpc because of log inconsistency!, term %d", rf.me, args.Term)
+		reply.Success = false
+	} else {
+		reply.Success = true
+		if len(args.Entries) != 0 {
+			for idx := range args.Entries {
+				leaderIdx := args.Entries[idx].Index
+				if leaderIdx <= len(rf.log) && args.Entries[idx].Term != rf.log[leaderIdx-1].Term {
+					rf.log[leaderIdx-1] = args.Entries[idx]
+				} else if leaderIdx == len(rf.log)+1 {
+					rf.log = append(rf.log, args.Entries[idx])
+				}
+			}
+		}
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
+	}
+
 	if rf.state != FOLLOWER {
 		log.Printf("%d: another leader, shift into follower", rf.me)
 		rf.state = FOLLOWER
@@ -328,6 +353,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.killed() {
 		return index, term, isLeader
 	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.state != LEADER {
@@ -337,6 +363,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// start from 1
 	newLog := LogEntry{rf.term, len(rf.log) + 1, command}
 	rf.log = append(rf.log, newLog)
+	assert(len(rf.log) == rf.lastLogIndex(), "failed ")
+	log.Printf("%d: start command : %v", rf.me, newLog)
 
 	go func() {
 		for idx := range rf.followerAppendCond {
@@ -372,6 +400,10 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) sendAppendEntriesOnce(idx int, isHeartBeat bool) {
 	rf.mu.Lock()
+	if rf.state != LEADER {
+		rf.mu.Unlock()
+		return
+	}
 	request := AppendEntriesRequest{}
 	request.Term = rf.term
 	request.LeaderId = rf.me
@@ -575,14 +607,16 @@ func (rf *Raft) sendFollowerRountine(idx int) {
 		for !rf.needSendLog(idx) {
 			rf.followerAppendCond[idx].Wait()
 		}
-		rf.sendAppendEntriesOnce(idx, false)
+		for rf.needSendLog(idx) {
+			rf.sendAppendEntriesOnce(idx, false)
+		}
 	}
 }
 
 func (rf *Raft) needSendLog(idx int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.state == LEADER && rf.log[len(rf.log)-1].Index >= rf.nextIndex[idx]
+	return rf.state == LEADER && rf.lastLogIndex() >= rf.nextIndex[idx]
 }
 
 func (rf *Raft) checkHeartBeat() {
