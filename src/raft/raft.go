@@ -176,7 +176,9 @@ func (rf *Raft) lastLogIndex() int {
 	if len(rf.log) == 0 {
 		return 0
 	} else {
-		return rf.log[len(rf.log)-1].Index
+		res := rf.log[len(rf.log)-1].Index
+		assert(len(rf.log) == res, "match failed")
+		return res
 	}
 }
 
